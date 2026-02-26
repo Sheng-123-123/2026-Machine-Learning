@@ -93,72 +93,116 @@ class DeepContextDependentChoice(tf.keras.Model):
         self.pair_mlp = tf.keras.Sequential(pair_layers, name="pair_mlp")
 
     def _compute_utilities(self, X, mask=None, training=False):
-        """
-        Compute utilities (logits) for each alternative.
-
-        Parameters
-        ----------
-        X : tf.Tensor
-            Shape (batch_size, n_alternatives, n_features)
-        mask : tf.Tensor or None
-            Optional availability mask of shape (batch_size, n_alternatives),
-            where 1/True means available, 0/False means unavailable.
-
-        Returns
-        -------
-        logits : tf.Tensor
-            Shape (batch_size, n_alternatives)
-        """
         # X: (B, A, F)
         B = tf.shape(X)[0]
         A = tf.shape(X)[1]
 
-        # Base utility f_base(x_i) -> (B, A, 1) -> (B, A)
+        # 1. Base utility f_base(x_i)
         base_u = self.base_mlp(X, training=training)
-        base_u = tf.squeeze(base_u, axis=-1)  # (B, A)
+        base_u = tf.squeeze(base_u, axis=-1)  # Result: (B, A)
 
-        # Pairwise context: for each ordered pair (i, j), build [x_i, x_j]
-        # Xi: (B, A, 1, F), Xj: (B, 1, A, F)
-        Xi = tf.expand_dims(X, axis=2)
-        Xj = tf.expand_dims(X, axis=1)
+        # 2. Pairwise Context
+        Xi = tf.expand_dims(X, axis=2)  # (B, A, 1, F)
+        Xj = tf.expand_dims(X, axis=1)  # (B, 1, A, F)
 
-        # Tile to (B, A, A, F)
-        Xi_tiled = tf.tile(Xi, [1, 1, A, 1])
-        Xj_tiled = tf.tile(Xj, [1, A, 1, 1])
+        # Leveraging broadcasting instead of explicit tf.tile saves memory
+        Xi_broadcast = tf.broadcast_to(Xi, [B, A, A, self.n_features])
+        Xj_broadcast = tf.broadcast_to(Xj, [B, A, A, self.n_features])
 
-        # Concatenate features [x_i, x_j]: (B, A, A, 2F)
-        pair_input = tf.concat([Xi_tiled, Xj_tiled], axis=-1)
-
-        # g_pair(x_i, x_j) -> (B, A, A, 1) -> (B, A, A)
+        pair_input = tf.concat([Xi_broadcast, Xj_broadcast], axis=-1)  # (B, A, A, 2F)
         pair_effect = self.pair_mlp(pair_input, training=training)
         pair_effect = tf.squeeze(pair_effect, axis=-1)  # (B, A, A)
 
-        # Remove self-effects: set diagonal elements g_pair(x_i, x_i) = 0
-        zero_diag = tf.zeros([B, A], dtype=pair_effect.dtype)
-        pair_effect = tf.linalg.set_diag(pair_effect, zero_diag)
+        # 3. Apply Diagonal Mask (Self-influence is zero)
+        diag_mask = 1.0 - tf.eye(A, dtype=pair_effect.dtype)
+        pair_effect = pair_effect * diag_mask  # (B, A, A)
 
-        # If mask is provided, ensure masked items do not influence others
+        # 4. Handle Optional Availability Mask
         if mask is not None:
             mask_f = tf.cast(mask, pair_effect.dtype)  # (B, A)
-            # Mask for i-dimension and j-dimension
-            mask_i = tf.expand_dims(mask_f, axis=2)  # (B, A, 1)
-            mask_j = tf.expand_dims(mask_f, axis=1)  # (B, 1, A)
-            # Zero out effects where either i or j is unavailable
-            pair_effect = pair_effect * mask_i * mask_j  # (B, A, A)
+            # mask_j ensures unavailable alternatives don't affect others
+            # mask_i ensures unavailable alternatives don't receive utility
+            mask_2d = tf.expand_dims(mask_f, axis=1) * tf.expand_dims(mask_f, axis=2)
+            pair_effect = pair_effect * mask_2d
 
-        # Sum over j for each i: context from all other alternatives -> (B, A)
-        context_u = tf.reduce_sum(pair_effect, axis=-1)
+        # 5. Aggregate and combine
+        context_u = tf.reduce_sum(pair_effect, axis=-1)  # (B, A)
+        utilities = base_u + context_u
 
-        # Total utility
-        utilities = base_u + context_u  # (B, A)
-
-        # Final masking for softmax: unavailable alts get huge negative utility
+        # 6. Final Logit Masking for Softmax
         if mask is not None:
             mask_bool = tf.cast(mask, tf.bool)
             very_neg = tf.constant(-1e9, dtype=utilities.dtype)
             utilities = tf.where(mask_bool, utilities, very_neg)
 
         return utilities
+    # def _compute_utilities(self, X, mask=None, training=False):
+    #     """
+    #     Compute utilities (logits) for each alternative.
+    #
+    #     Parameters
+    #     ----------
+    #     X : tf.Tensor
+    #         Shape (batch_size, n_alternatives, n_features)
+    #     mask : tf.Tensor or None
+    #         Optional availability mask of shape (batch_size, n_alternatives),
+    #         where 1/True means available, 0/False means unavailable.
+    #
+    #     Returns
+    #     -------
+    #     logits : tf.Tensor
+    #         Shape (batch_size, n_alternatives)
+    #     """
+    #     # X: (B, A, F)
+    #     B = tf.shape(X)[0]
+    #     A = tf.shape(X)[1]
+    #
+    #     # Base utility f_base(x_i) -> (B, A, 1) -> (B, A)
+    #     base_u = self.base_mlp(X, training=training)
+    #     base_u = tf.squeeze(base_u, axis=-1)  # (B, A)
+    #
+    #     # Pairwise context: for each ordered pair (i, j), build [x_i, x_j]
+    #     # Xi: (B, A, 1, F), Xj: (B, 1, A, F)
+    #     Xi = tf.expand_dims(X, axis=2)
+    #     Xj = tf.expand_dims(X, axis=1)
+    #
+    #     # Tile to (B, A, A, F)
+    #     Xi_tiled = tf.tile(Xi, [1, 1, A, 1])
+    #     Xj_tiled = tf.tile(Xj, [1, A, 1, 1])
+    #
+    #     # Concatenate features [x_i, x_j]: (B, A, A, 2F)
+    #     pair_input = tf.concat([Xi_tiled, Xj_tiled], axis=-1)
+    #
+    #     # g_pair(x_i, x_j) -> (B, A, A, 1) -> (B, A, A)
+    #     pair_effect = self.pair_mlp(pair_input, training=training)
+    #     pair_effect = tf.squeeze(pair_effect, axis=-1)  # (B, A, A)
+    #
+    #     # Remove self-effects: set diagonal elements g_pair(x_i, x_i) = 0
+    #     zero_diag = tf.zeros([B, A], dtype=pair_effect.dtype)
+    #     pair_effect = tf.linalg.set_diag(pair_effect, zero_diag)
+    #
+    #     # If mask is provided, ensure masked items do not influence others
+    #     if mask is not None:
+    #         mask_f = tf.cast(mask, pair_effect.dtype)  # (B, A)
+    #         # Mask for i-dimension and j-dimension
+    #         mask_i = tf.expand_dims(mask_f, axis=2)  # (B, A, 1)
+    #         mask_j = tf.expand_dims(mask_f, axis=1)  # (B, 1, A)
+    #         # Zero out effects where either i or j is unavailable
+    #         pair_effect = pair_effect * mask_i * mask_j  # (B, A, A)
+    #
+    #     # Sum over j for each i: context from all other alternatives -> (B, A)
+    #     context_u = tf.reduce_sum(pair_effect, axis=-1)
+    #
+    #     # Total utility
+    #     utilities = base_u + context_u  # (B, A)
+    #
+    #     # Final masking for softmax: unavailable alts get huge negative utility
+    #     if mask is not None:
+    #         mask_bool = tf.cast(mask, tf.bool)
+    #         very_neg = tf.constant(-1e9, dtype=utilities.dtype)
+    #         utilities = tf.where(mask_bool, utilities, very_neg)
+    #
+    #     return utilities
 
     def call(self, inputs, training=False):
         """
